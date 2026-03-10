@@ -5,6 +5,7 @@ import queue
 import tempfile
 import threading
 import time
+import warnings
 
 import numpy as np
 import soundcard as sc
@@ -16,7 +17,7 @@ import whisper
 
 SAMPLE_RATE = 16_000
 CHANNELS = 1
-RECORD_CHUNK_SECONDS = 1.5
+RECORD_CHUNK_SECONDS = 0.5
 TRANSCRIBE_WINDOW_SECONDS = 6
 
 
@@ -53,11 +54,16 @@ def record_desktop_audio(
     frames_per_chunk = int(SAMPLE_RATE * RECORD_CHUNK_SECONDS)
 
     try:
-        with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
-            while not stop_event.is_set():
-                block = recorder.record(numframes=frames_per_chunk)
-                mono = np.squeeze(block).astype(np.float32)
-                audio_queue.put(mono)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="data discontinuity in recording",
+            )
+            with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
+                while not stop_event.is_set():
+                    block = recorder.record(numframes=frames_per_chunk)
+                    mono = np.squeeze(block).astype(np.float32)
+                    audio_queue.put(mono)
     except Exception as exc:
         error_queue.put(f"Audio recording failed: {exc}")
     finally:
@@ -83,6 +89,7 @@ def transcribe_from_queue(
     audio_queue: queue.Queue,
     text_queue: queue.Queue,
     error_queue: queue.Queue,
+    control: dict,
     model_name: str,
 ):
     try:
@@ -111,13 +118,17 @@ def transcribe_from_queue(
 
             text = _transcribe_audio_array(model, merged_audio)
             if text:
-                text_queue.put(text)
+                with control["lock"]:
+                    active_section_idx = control["active_section_idx"]
+                text_queue.put((active_section_idx, text))
 
     if chunks:
         merged_audio = np.concatenate(chunks)
         text = _transcribe_audio_array(model, merged_audio)
         if text:
-            text_queue.put(text)
+            with control["lock"]:
+                active_section_idx = control["active_section_idx"]
+            text_queue.put((active_section_idx, text))
 
 
 def ensure_state():
@@ -130,7 +141,8 @@ def ensure_state():
         "transcribe_thread": None,
         "text_queue": None,
         "error_queue": None,
-        "transcript_parts": [],
+        "transcript_sections": [{"parts": []}],
+        "control": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -142,11 +154,15 @@ def start_capture(model_name: str):
         return
 
     st.session_state.worker_error = ""
-    st.session_state.transcript_parts = []
+    st.session_state.transcript_sections = [{"parts": []}]
     st.session_state.stop_event = threading.Event()
     st.session_state.audio_queue = queue.Queue()
     st.session_state.text_queue = queue.Queue()
     st.session_state.error_queue = queue.Queue()
+    st.session_state.control = {
+        "active_section_idx": 0,
+        "lock": threading.Lock(),
+    }
 
     st.session_state.audio_thread = threading.Thread(
         target=record_desktop_audio,
@@ -164,6 +180,7 @@ def start_capture(model_name: str):
             st.session_state.audio_queue,
             st.session_state.text_queue,
             st.session_state.error_queue,
+            st.session_state.control,
             model_name,
         ),
         daemon=True,
@@ -189,28 +206,43 @@ def stop_capture():
 
 
 def clear_transcript():
-    st.session_state.transcript_parts = []
+    st.session_state.transcript_sections = [{"parts": []}]
+    if st.session_state.control is not None:
+        with st.session_state.control["lock"]:
+            st.session_state.control["active_section_idx"] = 0
+
+
+def split_transcript_section():
+    st.session_state.transcript_sections.append({"parts": []})
+    if st.session_state.control is not None:
+        with st.session_state.control["lock"]:
+            st.session_state.control["active_section_idx"] = (
+                len(st.session_state.transcript_sections) - 1
+            )
 
 
 def drain_queues():
     if st.session_state.text_queue is not None:
         while not st.session_state.text_queue.empty():
-            st.session_state.transcript_parts.append(st.session_state.text_queue.get())
+            section_idx, text = st.session_state.text_queue.get()
+            if section_idx >= len(st.session_state.transcript_sections):
+                section_idx = len(st.session_state.transcript_sections) - 1
+            st.session_state.transcript_sections[section_idx]["parts"].append(text)
     if st.session_state.error_queue is not None:
         while not st.session_state.error_queue.empty():
             st.session_state.worker_error = st.session_state.error_queue.get()
 
 
-def copy_button_component(text: str):
+def copy_button_component(text: str, section_idx: int):
     escaped = html.escape(text, quote=True)
     components.html(
         f"""
         <div style="display:flex; align-items:center; gap:8px;">
-          <input id="transcript-src" type="hidden" value="{escaped}" />
+          <input id="transcript-src-{section_idx}" type="hidden" value="{escaped}" />
           <button
             style="padding:0.5rem 0.75rem; border:1px solid #ccc; border-radius:6px; cursor:pointer;"
             onclick="
-              const text = document.getElementById('transcript-src').value;
+              const text = document.getElementById('transcript-src-{section_idx}').value;
               navigator.clipboard.writeText(text);
               this.textContent='Copied';
               setTimeout(() => this.textContent='Copy Transcript', 1200);
@@ -257,7 +289,10 @@ def main():
         if st.button("Stop", use_container_width=True, disabled=not st.session_state.running):
             stop_capture()
     with col3:
-        if st.button("Clear", use_container_width=True, disabled=st.session_state.running):
+        if st.button("Split", use_container_width=True, disabled=not st.session_state.running):
+            split_transcript_section()
+
+    if st.button("Clear All Sections", use_container_width=True, disabled=st.session_state.running):
             clear_transcript()
 
     status_text = "Recording..." if st.session_state.running else "Stopped"
@@ -268,12 +303,17 @@ def main():
     if st.session_state.worker_error:
         st.error(st.session_state.worker_error)
 
-    transcript_text = " ".join(st.session_state.transcript_parts).strip()
-    st.text_area("Transcript", value=transcript_text, height=280)
+    has_any_text = False
+    for i, section in enumerate(st.session_state.transcript_sections):
+        section_text = " ".join(section["parts"]).strip()
+        st.text_area(f"Section {i + 1}", value=section_text, height=200, disabled=True)
+        if section_text:
+            has_any_text = True
+            copy_button_component(section_text, i)
+        else:
+            st.caption(f"Section {i + 1} is empty.")
 
-    if transcript_text:
-        copy_button_component(transcript_text)
-    else:
+    if not has_any_text:
         st.caption("Transcript is empty.")
 
     if st.session_state.running:
