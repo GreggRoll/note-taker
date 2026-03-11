@@ -11,13 +11,8 @@ import wave
 import streamlit as st
 import streamlit.components.v1 as components
 import whisper
-try:
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode
-    WEBRTC_AVAILABLE = True
-except Exception:
-    webrtc_streamer = None
-    WebRtcMode = None
-    WEBRTC_AVAILABLE = False
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+WEBRTC_AVAILABLE = True
 
 
 SAMPLE_RATE = 16_000
@@ -151,56 +146,76 @@ def start_capture(model_name: str):
         "lock": threading.Lock(),
     }
 
-    # Start browser-based WebRTC capture
-    if WEBRTC_AVAILABLE:
-        ctx = webrtc_streamer(
-            key="desktop_audio",
-            mode=WebRtcMode.SENDONLY,
-            media_stream_constraints={"audio": True, "video": False},
-        )
+    # Build RTC configuration from environment (allow STUN/TURN overrides)
+    def build_rtc_configuration():
+        ice_servers = []
+        stun_env = os.getenv("STUN_SERVERS", "stun:stun.l.google.com:19302")
+        for s in stun_env.split(","):
+            s = s.strip()
+            if s:
+                ice_servers.append({"urls": [s]})
 
-        def browser_reader(ctx):
-            try:
-                while not st.session_state.stop_event.is_set() and ctx.state.playing:
-                    try:
-                        frame = ctx.audio_receiver.get_frame(timeout=1)
-                    except Exception:
-                        continue
-                    try:
-                        arr = frame.to_ndarray()
-                        if arr.ndim == 2:
-                            mono = np.mean(arr, axis=0).astype(np.float32)
-                        else:
-                            mono = arr.astype(np.float32)
-                        st.session_state.audio_queue.put(mono)
-                    except Exception as exc:
-                        st.session_state.error_queue.put(f"Audio frame processing error: {exc}")
-            except Exception as exc:
-                st.session_state.error_queue.put(f"Browser audio reader failed: {exc}")
+        turn_url = os.getenv("TURN_URL")
+        turn_username = os.getenv("TURN_USERNAME")
+        turn_password = os.getenv("TURN_PASSWORD")
+        if turn_url and turn_username and turn_password:
+            ice_servers.append({
+                "urls": [turn_url],
+                "username": turn_username,
+                "credential": turn_password,
+            })
 
-        st.session_state.audio_thread = threading.Thread(
-            target=browser_reader, args=(ctx,), daemon=True
-        )
-        st.session_state.transcribe_thread = threading.Thread(
-            target=transcribe_from_queue,
-            args=(
-                st.session_state.stop_event,
-                st.session_state.audio_queue,
-                st.session_state.text_queue,
-                st.session_state.error_queue,
-                st.session_state.control,
-                model_name,
-            ),
-            daemon=True,
-        )
+        return {"iceServers": ice_servers} if ice_servers else {}
 
-        st.session_state.audio_thread.start()
-        st.session_state.transcribe_thread.start()
-        st.session_state.running = True
-    else:
-        st.session_state.error_queue.put(
-            "WebRTC capture is not available. Install streamlit-webrtc to use browser capture."
-        )
+    rtc_config = build_rtc_configuration()
+
+    ctx = webrtc_streamer(
+        key="desktop_audio",
+        mode=WebRtcMode.SENDONLY,
+        media_stream_constraints={"audio": True, "video": False},
+        rtc_configuration=rtc_config,
+    )
+
+    def browser_reader(ctx, stop_event, audio_queue, error_queue):
+        try:
+            while not stop_event.is_set() and ctx.state.playing:
+                try:
+                    frame = ctx.audio_receiver.get_frame(timeout=1)
+                except Exception:
+                    continue
+                try:
+                    arr = frame.to_ndarray()
+                    if arr.ndim == 2:
+                        mono = np.mean(arr, axis=0).astype(np.float32)
+                    else:
+                        mono = arr.astype(np.float32)
+                    audio_queue.put(mono)
+                except Exception as exc:
+                    error_queue.put(f"Audio frame processing error: {exc}")
+        except Exception as exc:
+            error_queue.put(f"Browser audio reader failed: {exc}")
+
+    st.session_state.audio_thread = threading.Thread(
+        target=browser_reader,
+        args=(ctx, st.session_state.stop_event, st.session_state.audio_queue, st.session_state.error_queue),
+        daemon=True,
+    )
+    st.session_state.transcribe_thread = threading.Thread(
+        target=transcribe_from_queue,
+        args=(
+            st.session_state.stop_event,
+            st.session_state.audio_queue,
+            st.session_state.text_queue,
+            st.session_state.error_queue,
+            st.session_state.control,
+            model_name,
+        ),
+        daemon=True,
+    )
+
+    st.session_state.audio_thread.start()
+    st.session_state.transcribe_thread.start()
+    st.session_state.running = True
 
 
 def stop_capture():
@@ -305,7 +320,7 @@ def main():
             split_transcript_section()
 
     if st.button("Clear All Sections", use_container_width=True, disabled=st.session_state.running):
-            clear_transcript()
+        clear_transcript()
 
     status_text = "Recording..." if st.session_state.running else "Stopped"
     st.caption(f"Status: {status_text}")
