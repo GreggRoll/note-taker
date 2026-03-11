@@ -1,5 +1,5 @@
 streamlit
 openai-whisper
-soundcard
-soundfile
 numpy<2
+streamlit-webrtc
+av

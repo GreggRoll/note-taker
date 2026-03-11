@@ -1,5 +1,4 @@
 import html
-import ctypes
 import os
 import queue
 import tempfile
@@ -8,11 +7,17 @@ import time
 import warnings
 
 import numpy as np
-import soundcard as sc
-import soundfile as sf
+import wave
 import streamlit as st
 import streamlit.components.v1 as components
 import whisper
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    WEBRTC_AVAILABLE = True
+except Exception:
+    webrtc_streamer = None
+    WebRtcMode = None
+    WEBRTC_AVAILABLE = False
 
 
 SAMPLE_RATE = 16_000
@@ -37,38 +42,11 @@ def numpy_major_version() -> int:
 def record_desktop_audio(
     stop_event: threading.Event, audio_queue: queue.Queue, error_queue: queue.Queue
 ):
-    coinit_result = None
-    if os.name == "nt":
-        # soundcard uses Windows COM APIs; worker threads must initialize COM explicitly.
-        coinit_result = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
-
-    try:
-        speaker = sc.default_speaker()
-        microphone = sc.get_microphone(speaker.name, include_loopback=True)
-    except Exception as exc:
-        error_queue.put(
-            f"Audio capture setup failed. Check your desktop output device. Details: {exc}"
-        )
-        return
-
-    frames_per_chunk = int(SAMPLE_RATE * RECORD_CHUNK_SECONDS)
-
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="data discontinuity in recording",
-            )
-            with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
-                while not stop_event.is_set():
-                    block = recorder.record(numframes=frames_per_chunk)
-                    mono = np.squeeze(block).astype(np.float32)
-                    audio_queue.put(mono)
-    except Exception as exc:
-        error_queue.put(f"Audio recording failed: {exc}")
-    finally:
-        if os.name == "nt" and coinit_result in (0, 1):
-            ctypes.windll.ole32.CoUninitialize()
+    # Local desktop recording via soundcard has been removed; use browser
+    # capture (streamlit-webrtc) instead. Signal an error if this function
+    # is invoked.
+    error_queue.put("Local desktop recording is not supported. Use browser capture.")
+    return
 
 
 def _transcribe_audio_array(model, audio_array: np.ndarray) -> str:
@@ -76,7 +54,16 @@ def _transcribe_audio_array(model, audio_array: np.ndarray) -> str:
         temp_path = tmp.name
 
     try:
-        sf.write(temp_path, audio_array, SAMPLE_RATE)
+        # Write WAV using the standard library to avoid extra deps.
+        audio = audio_array.astype(np.float32)
+        clipped = np.clip(audio, -1.0, 1.0)
+        int16 = (clipped * 32767).astype(np.int16)
+        with wave.open(temp_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(int16.tobytes())
+
         result = model.transcribe(temp_path, fp16=False)
         return result.get("text", "").strip()
     finally:
@@ -164,31 +151,56 @@ def start_capture(model_name: str):
         "lock": threading.Lock(),
     }
 
-    st.session_state.audio_thread = threading.Thread(
-        target=record_desktop_audio,
-        args=(
-            st.session_state.stop_event,
-            st.session_state.audio_queue,
-            st.session_state.error_queue,
-        ),
-        daemon=True,
-    )
-    st.session_state.transcribe_thread = threading.Thread(
-        target=transcribe_from_queue,
-        args=(
-            st.session_state.stop_event,
-            st.session_state.audio_queue,
-            st.session_state.text_queue,
-            st.session_state.error_queue,
-            st.session_state.control,
-            model_name,
-        ),
-        daemon=True,
-    )
+    # Start browser-based WebRTC capture
+    if WEBRTC_AVAILABLE:
+        ctx = webrtc_streamer(
+            key="desktop_audio",
+            mode=WebRtcMode.SENDONLY,
+            media_stream_constraints={"audio": True, "video": False},
+        )
 
-    st.session_state.audio_thread.start()
-    st.session_state.transcribe_thread.start()
-    st.session_state.running = True
+        def browser_reader(ctx):
+            try:
+                while not st.session_state.stop_event.is_set() and ctx.state.playing:
+                    try:
+                        frame = ctx.audio_receiver.get_frame(timeout=1)
+                    except Exception:
+                        continue
+                    try:
+                        arr = frame.to_ndarray()
+                        if arr.ndim == 2:
+                            mono = np.mean(arr, axis=0).astype(np.float32)
+                        else:
+                            mono = arr.astype(np.float32)
+                        st.session_state.audio_queue.put(mono)
+                    except Exception as exc:
+                        st.session_state.error_queue.put(f"Audio frame processing error: {exc}")
+            except Exception as exc:
+                st.session_state.error_queue.put(f"Browser audio reader failed: {exc}")
+
+        st.session_state.audio_thread = threading.Thread(
+            target=browser_reader, args=(ctx,), daemon=True
+        )
+        st.session_state.transcribe_thread = threading.Thread(
+            target=transcribe_from_queue,
+            args=(
+                st.session_state.stop_event,
+                st.session_state.audio_queue,
+                st.session_state.text_queue,
+                st.session_state.error_queue,
+                st.session_state.control,
+                model_name,
+            ),
+            daemon=True,
+        )
+
+        st.session_state.audio_thread.start()
+        st.session_state.transcribe_thread.start()
+        st.session_state.running = True
+    else:
+        st.session_state.error_queue.put(
+            "WebRTC capture is not available. Install streamlit-webrtc to use browser capture."
+        )
 
 
 def stop_capture():
@@ -266,8 +278,8 @@ def main():
 
     if not numpy_ok:
         st.error(
-            "Detected NumPy 2.x, which is incompatible with soundcard recording in this app. "
-            "Install NumPy < 2 (example: pip install \"numpy<2\") and restart Streamlit."
+            "Detected NumPy 2.x — some dependencies may be incompatible. "
+            "If you encounter issues, consider installing NumPy < 2 (pip install \"numpy<2\")."
         )
 
     model_name = st.selectbox(
