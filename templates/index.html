@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Desktop Audio to Text</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <h1>Desktop Audio to Text</h1>
+    <p class="subhead">Capture server desktop audio, transcribe with Whisper, and copy transcript sections.</p>
+
+    <section class="controls">
+      <label for="model">Whisper model</label>
+      <select id="model">
+        {% for model in models %}
+        <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+        {% endfor %}
+      </select>
+
+      <div class="button-row">
+        <button id="start">Start</button>
+        <button id="stop">Stop</button>
+        <button id="split">Split</button>
+        <button id="clear">Clear All Sections</button>
+      </div>
+    </section>
+
+    <p id="status" class="status">Status: loading...</p>
+    <p id="error" class="error"></p>
+
+    <section id="sections"></section>
+  </main>
+
+  <script>
+    const modelSelect = document.getElementById('model');
+    const statusEl = document.getElementById('status');
+    const errorEl = document.getElementById('error');
+    const sectionsEl = document.getElementById('sections');
+    const buttons = {
+      start: document.getElementById('start'),
+      stop: document.getElementById('stop'),
+      split: document.getElementById('split'),
+      clear: document.getElementById('clear'),
+    };
+
+    let latestState = null;
+
+    async function post(path, body = {}) {
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let msg = 'Request failed';
+        try {
+          const data = await res.json();
+          msg = data.detail || msg;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+    }
+
+    function copyText(text, btn) {
+      navigator.clipboard.writeText(text).then(() => {
+        const old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => btn.textContent = old, 1000);
+      });
+    }
+
+    function render(state) {
+      latestState = state;
+      statusEl.textContent = `Status: ${state.running ? 'Recording...' : 'Stopped'}`;
+      errorEl.textContent = state.error || '';
+
+      buttons.start.disabled = state.running || !state.numpy_ok;
+      buttons.stop.disabled = !state.running;
+      buttons.split.disabled = !state.running;
+      buttons.clear.disabled = state.running;
+      modelSelect.disabled = state.running;
+
+      sectionsEl.innerHTML = '';
+      const sections = state.sections || [];
+
+      if (!sections.length || sections.every(s => !s)) {
+        const empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = 'Transcript is empty.';
+        sectionsEl.appendChild(empty);
+      }
+
+      sections.forEach((text, idx) => {
+        const card = document.createElement('article');
+        card.className = 'section-card';
+
+        const title = document.createElement('h2');
+        title.textContent = `Section ${idx + 1}`;
+        card.appendChild(title);
+
+        const area = document.createElement('textarea');
+        area.value = text || '';
+        area.readOnly = true;
+        card.appendChild(area);
+
+        if (text) {
+          const copyBtn = document.createElement('button');
+          copyBtn.textContent = 'Copy Transcript';
+          copyBtn.onclick = () => copyText(text, copyBtn);
+          card.appendChild(copyBtn);
+        }
+
+        sectionsEl.appendChild(card);
+      });
+
+      if (!state.numpy_ok) {
+        errorEl.textContent = 'NumPy 2.x detected and unsupported for soundcard loopback. Install numpy<2 on the server.';
+      }
+    }
+
+    async function refreshState() {
+      try {
+        const res = await fetch('/api/state');
+        const state = await res.json();
+        render(state);
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    }
+
+    buttons.start.onclick = async () => {
+      try {
+        await post('/api/start', { model: modelSelect.value });
+        await refreshState();
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    };
+
+    buttons.stop.onclick = async () => {
+      try {
+        await post('/api/stop');
+        await refreshState();
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    };
+
+    buttons.split.onclick = async () => {
+      try {
+        await post('/api/split');
+        await refreshState();
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    };
+
+    buttons.clear.onclick = async () => {
+      try {
+        await post('/api/clear');
+        await refreshState();
+      } catch (err) {
+        errorEl.textContent = err.message;
+      }
+    };
+
+    refreshState();
+    setInterval(refreshState, 1000);
+  </script>
+</body>
+</html>

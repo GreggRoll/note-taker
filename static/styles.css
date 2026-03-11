@@ -1,0 +1,91 @@
+:root {
+  font-family: Segoe UI, Arial, sans-serif;
+  color: #1f2937;
+  background: #f3f4f6;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(135deg, #eef2ff, #f8fafc);
+}
+
+.shell {
+  max-width: 860px;
+  margin: 24px auto;
+  padding: 20px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+}
+
+h1 {
+  margin-bottom: 4px;
+}
+
+.subhead {
+  margin-top: 0;
+  color: #4b5563;
+}
+
+.controls {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+button,
+select {
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled,
+select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.status {
+  font-weight: 600;
+}
+
+.error {
+  color: #b91c1c;
+  min-height: 20px;
+}
+
+.section-card {
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+
+.section-card h2 {
+  margin-top: 0;
+  font-size: 18px;
+}
+
+.section-card textarea {
+  width: 100%;
+  min-height: 140px;
+  padding: 8px;
+  box-sizing: border-box;
+  margin-bottom: 8px;
+}
+
+.empty {
+  color: #6b7280;
+}

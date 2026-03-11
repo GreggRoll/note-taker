@@ -1,4 +1,6 @@
-streamlit
+fastapi
+uvicorn[standard]
+jinja2
 openai-whisper
 soundcard
 soundfile

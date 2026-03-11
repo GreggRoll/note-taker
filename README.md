@@ -1,20 +1,21 @@
-# Desktop Audio Whisper Transcriber
+# Desktop Audio Whisper Transcriber (Web Deployable)
 
-Real-time desktop audio transcription with a simple Streamlit interface powered by OpenAI Whisper.
+Web app that captures **desktop/system audio on the host server**, transcribes with Whisper, and exposes controls in a browser UI.
 
-## Features
+## Important Architecture Note
 
-- Record **system/desktop audio** using loopback capture.
-- Start and stop transcription with one click.
-- View transcript updates inside the app.
-- Copy the transcript to clipboard from the UI.
-- Choose Whisper model size (`tiny`, `base`, `small`, `medium`).
+This app captures audio from the machine where the Python server process runs.
+
+- If you deploy to a cloud VM/container with no audio output device, desktop loopback capture will fail.
+- To capture real desktop audio, run on a Windows host/session that has an active playback device.
+- Browser clients only control and view transcripts; the audio source is server-side.
 
 ## Tech Stack
 
 | Layer | Package |
 |---|---|
-| UI | `streamlit` |
+| Web server/API | `fastapi`, `uvicorn` |
+| Server-rendered UI | `jinja2` |
 | Speech-to-text | `openai-whisper` |
 | Desktop loopback audio | `soundcard` |
 | Audio file handling | `soundfile` |
@@ -26,39 +27,35 @@ Real-time desktop audio transcription with a simple Streamlit interface powered 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-streamlit run app.py
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Open the local URL printed by Streamlit (usually `http://localhost:8501`).
+Open `http://localhost:8000`.
 
 ## How To Use
 
-1. Select a Whisper model.
-2. Click `Start` to begin desktop audio capture and transcription.
-3. Click `Stop` to flush remaining audio and finalize text.
-4. Click `Copy Transcript` to copy everything to your clipboard.
-5. Use `Clear` to reset the transcript.
+1. Pick a Whisper model.
+2. Click `Start` to begin capture and transcription.
+3. Click `Split` to start a new transcript section.
+4. Click `Stop` to flush remaining audio and finalize text.
+5. Use `Copy Transcript` per section.
+6. Click `Clear All Sections` while stopped.
 
-## Compatibility Notes
+## Deployment Notes
 
-- First run may take longer while Whisper model weights download.
-- This app currently expects NumPy 1.x for `soundcard` compatibility.
+- Keep the process attached to an interactive desktop session if you need loopback audio.
+- On Windows Server, ensure audio service/device is enabled.
+- First model load can be slow due to Whisper weights download.
 - If NumPy 2.x is installed, run:
 
 ```powershell
 pip install "numpy<2"
 ```
 
-Then restart Streamlit.
-
 ## Project Files
 
-- `app.py`: Streamlit app, audio capture threads, Whisper transcription flow.
+- `app.py`: FastAPI app and API routes.
+- `transcription_engine.py`: audio capture and Whisper worker engine.
+- `templates/index.html`: browser UI.
+- `static/styles.css`: UI styles.
 - `requirements.txt`: Python dependencies.
-
-## Troubleshooting
-
-- `Error 0x800401f0`: COM initialization issue on Windows.
-  - The app already initializes COM in the recording thread. If this persists, restart the app and verify your default playback device.
-- `fromstring is removed, use frombuffer instead`:
-  - Install NumPy 1.x with `pip install "numpy<2"`.

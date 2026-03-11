@@ -1,325 +1,71 @@
-import html
-import ctypes
-import os
-import queue
-import tempfile
-import threading
-import time
-import warnings
+from pathlib import Path
 
-import numpy as np
-import soundcard as sc
-import soundfile as sf
-import streamlit as st
-import streamlit.components.v1 as components
-import whisper
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from starlette.requests import Request
+
+from transcription_engine import TranscriptionEngine
 
 
-SAMPLE_RATE = 16_000
-CHANNELS = 1
-RECORD_CHUNK_SECONDS = 0.5
-TRANSCRIBE_WINDOW_SECONDS = 6
+MODELS = ["tiny", "base", "small", "medium"]
+
+app = FastAPI(title="Desktop Audio Whisper Transcriber")
+engine = TranscriptionEngine()
+
+base_dir = Path(__file__).parent
+app.mount("/static", StaticFiles(directory=base_dir / "static"), name="static")
+templates = Jinja2Templates(directory=str(base_dir / "templates"))
 
 
-@st.cache_resource(show_spinner=False)
-def load_whisper_model(model_name: str):
-    return whisper.load_model(model_name)
+class StartPayload(BaseModel):
+    model: str = "base"
 
 
-def numpy_major_version() -> int:
-    version = np.__version__.split(".", 1)[0]
-    try:
-        return int(version)
-    except ValueError:
-        return 0
-
-
-def record_desktop_audio(
-    stop_event: threading.Event, audio_queue: queue.Queue, error_queue: queue.Queue
-):
-    coinit_result = None
-    if os.name == "nt":
-        # soundcard uses Windows COM APIs; worker threads must initialize COM explicitly.
-        coinit_result = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
-
-    try:
-        speaker = sc.default_speaker()
-        microphone = sc.get_microphone(speaker.name, include_loopback=True)
-    except Exception as exc:
-        error_queue.put(
-            f"Audio capture setup failed. Check your desktop output device. Details: {exc}"
-        )
-        return
-
-    frames_per_chunk = int(SAMPLE_RATE * RECORD_CHUNK_SECONDS)
-
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="data discontinuity in recording",
-            )
-            with microphone.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
-                while not stop_event.is_set():
-                    block = recorder.record(numframes=frames_per_chunk)
-                    mono = np.squeeze(block).astype(np.float32)
-                    audio_queue.put(mono)
-    except Exception as exc:
-        error_queue.put(f"Audio recording failed: {exc}")
-    finally:
-        if os.name == "nt" and coinit_result in (0, 1):
-            ctypes.windll.ole32.CoUninitialize()
-
-
-def _transcribe_audio_array(model, audio_array: np.ndarray) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        temp_path = tmp.name
-
-    try:
-        sf.write(temp_path, audio_array, SAMPLE_RATE)
-        result = model.transcribe(temp_path, fp16=False)
-        return result.get("text", "").strip()
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def transcribe_from_queue(
-    stop_event: threading.Event,
-    audio_queue: queue.Queue,
-    text_queue: queue.Queue,
-    error_queue: queue.Queue,
-    control: dict,
-    model_name: str,
-):
-    try:
-        model = load_whisper_model(model_name)
-    except Exception as exc:
-        error_queue.put(f"Whisper model failed to load: {exc}")
-        return
-
-    window_samples = int(SAMPLE_RATE * TRANSCRIBE_WINDOW_SECONDS)
-    chunks = []
-    total_samples = 0
-
-    while not stop_event.is_set() or not audio_queue.empty():
-        try:
-            audio_chunk = audio_queue.get(timeout=0.25)
-        except queue.Empty:
-            continue
-
-        chunks.append(audio_chunk)
-        total_samples += len(audio_chunk)
-
-        if total_samples >= window_samples:
-            merged_audio = np.concatenate(chunks)
-            chunks = []
-            total_samples = 0
-
-            text = _transcribe_audio_array(model, merged_audio)
-            if text:
-                with control["lock"]:
-                    active_section_idx = control["active_section_idx"]
-                text_queue.put((active_section_idx, text))
-
-    if chunks:
-        merged_audio = np.concatenate(chunks)
-        text = _transcribe_audio_array(model, merged_audio)
-        if text:
-            with control["lock"]:
-                active_section_idx = control["active_section_idx"]
-            text_queue.put((active_section_idx, text))
-
-
-def ensure_state():
-    defaults = {
-        "running": False,
-        "worker_error": "",
-        "stop_event": None,
-        "audio_queue": None,
-        "audio_thread": None,
-        "transcribe_thread": None,
-        "text_queue": None,
-        "error_queue": None,
-        "transcript_sections": [{"parts": []}],
-        "control": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-def start_capture(model_name: str):
-    if st.session_state.running:
-        return
-
-    st.session_state.worker_error = ""
-    st.session_state.transcript_sections = [{"parts": []}]
-    st.session_state.stop_event = threading.Event()
-    st.session_state.audio_queue = queue.Queue()
-    st.session_state.text_queue = queue.Queue()
-    st.session_state.error_queue = queue.Queue()
-    st.session_state.control = {
-        "active_section_idx": 0,
-        "lock": threading.Lock(),
-    }
-
-    st.session_state.audio_thread = threading.Thread(
-        target=record_desktop_audio,
-        args=(
-            st.session_state.stop_event,
-            st.session_state.audio_queue,
-            st.session_state.error_queue,
-        ),
-        daemon=True,
-    )
-    st.session_state.transcribe_thread = threading.Thread(
-        target=transcribe_from_queue,
-        args=(
-            st.session_state.stop_event,
-            st.session_state.audio_queue,
-            st.session_state.text_queue,
-            st.session_state.error_queue,
-            st.session_state.control,
-            model_name,
-        ),
-        daemon=True,
-    )
-
-    st.session_state.audio_thread.start()
-    st.session_state.transcribe_thread.start()
-    st.session_state.running = True
-
-
-def stop_capture():
-    if not st.session_state.running:
-        return
-
-    st.session_state.stop_event.set()
-
-    if st.session_state.audio_thread is not None:
-        st.session_state.audio_thread.join(timeout=3)
-    if st.session_state.transcribe_thread is not None:
-        st.session_state.transcribe_thread.join(timeout=6)
-
-    st.session_state.running = False
-
-
-def clear_transcript():
-    st.session_state.transcript_sections = [{"parts": []}]
-    if st.session_state.control is not None:
-        with st.session_state.control["lock"]:
-            st.session_state.control["active_section_idx"] = 0
-
-
-def split_transcript_section():
-    st.session_state.transcript_sections.append({"parts": []})
-    if st.session_state.control is not None:
-        with st.session_state.control["lock"]:
-            st.session_state.control["active_section_idx"] = (
-                len(st.session_state.transcript_sections) - 1
-            )
-
-
-def drain_queues():
-    if st.session_state.text_queue is not None:
-        while not st.session_state.text_queue.empty():
-            section_idx, text = st.session_state.text_queue.get()
-            if section_idx >= len(st.session_state.transcript_sections):
-                section_idx = len(st.session_state.transcript_sections) - 1
-            st.session_state.transcript_sections[section_idx]["parts"].append(text)
-    if st.session_state.error_queue is not None:
-        while not st.session_state.error_queue.empty():
-            st.session_state.worker_error = st.session_state.error_queue.get()
-
-
-def copy_button_component(text: str, section_idx: int):
-    escaped = html.escape(text, quote=True)
-    components.html(
-        f"""
-        <div style="display:flex; align-items:center; gap:8px;">
-          <input id="transcript-src-{section_idx}" type="hidden" value="{escaped}" />
-          <button
-            style="padding:0.5rem 0.75rem; border:1px solid #ccc; border-radius:6px; cursor:pointer;"
-            onclick="
-              const text = document.getElementById('transcript-src-{section_idx}').value;
-              navigator.clipboard.writeText(text);
-              this.textContent='Copied';
-              setTimeout(() => this.textContent='Copy Transcript', 1200);
-            "
-          >
-            Copy Transcript
-          </button>
-        </div>
-        """,
-        height=55,
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "models": MODELS,
+            "default_model": "base",
+        },
     )
 
 
-def main():
-    st.set_page_config(page_title="Desktop Audio Transcriber", layout="centered")
-    st.title("Desktop Audio to Text")
-    st.write("Capture system audio, transcribe with Whisper, then copy the transcript.")
-
-    ensure_state()
-    numpy_ok = numpy_major_version() < 2
-
-    if not numpy_ok:
-        st.error(
-            "Detected NumPy 2.x, which is incompatible with soundcard recording in this app. "
-            "Install NumPy < 2 (example: pip install \"numpy<2\") and restart Streamlit."
-        )
-
-    model_name = st.selectbox(
-        "Whisper model",
-        ["tiny", "base", "small", "medium"],
-        index=1,
-        disabled=st.session_state.running,
-    )
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button(
-            "Start",
-            use_container_width=True,
-            disabled=st.session_state.running or not numpy_ok,
-        ):
-            start_capture(model_name)
-    with col2:
-        if st.button("Stop", use_container_width=True, disabled=not st.session_state.running):
-            stop_capture()
-    with col3:
-        if st.button("Split", use_container_width=True, disabled=not st.session_state.running):
-            split_transcript_section()
-
-    if st.button("Clear All Sections", use_container_width=True, disabled=st.session_state.running):
-            clear_transcript()
-
-    status_text = "Recording..." if st.session_state.running else "Stopped"
-    st.caption(f"Status: {status_text}")
-
-    drain_queues()
-
-    if st.session_state.worker_error:
-        st.error(st.session_state.worker_error)
-
-    has_any_text = False
-    for i, section in enumerate(st.session_state.transcript_sections):
-        section_text = " ".join(section["parts"]).strip()
-        st.text_area(f"Section {i + 1}", value=section_text, height=200, disabled=True)
-        if section_text:
-            has_any_text = True
-            copy_button_component(section_text, i)
-        else:
-            st.caption(f"Section {i + 1} is empty.")
-
-    if not has_any_text:
-        st.caption("Transcript is empty.")
-
-    if st.session_state.running:
-        time.sleep(1)
-        st.rerun()
+@app.get("/api/state")
+def state():
+    return engine.snapshot()
 
 
-if __name__ == "__main__":
-    main()
+@app.post("/api/start")
+def start(payload: StartPayload):
+    if payload.model not in MODELS:
+        raise HTTPException(status_code=400, detail="Unsupported Whisper model")
+    if not (engine.snapshot().get("numpy_ok")):
+        raise HTTPException(status_code=400, detail='NumPy 2.x detected. Install "numpy<2".')
+    engine.start(payload.model)
+    return {"ok": True}
+
+
+@app.post("/api/stop")
+def stop():
+    engine.stop()
+    return {"ok": True}
+
+
+@app.post("/api/split")
+def split():
+    engine.split()
+    return {"ok": True}
+
+
+@app.post("/api/clear")
+def clear():
+    if engine.snapshot()["running"]:
+        raise HTTPException(status_code=400, detail="Cannot clear while recording")
+    engine.clear()
+    return {"ok": True}
